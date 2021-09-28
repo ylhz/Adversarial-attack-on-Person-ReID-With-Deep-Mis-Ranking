@@ -10,7 +10,10 @@ import os.path as osp
 from scipy.io import loadmat
 import numpy as np
 import h5py
-from scipy.misc import imsave
+try:
+    from scipy.misc import imsave
+except:
+    from imageio import imsave
 
 from util.utils import mkdir_if_missing, write_json, read_json
 

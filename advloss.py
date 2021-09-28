@@ -53,15 +53,15 @@ class adv_CrossEntropyLabelSmooth(nn.Module):
     # for i in range(n):
     #   if adv_target[i] == pids[i]: adv_target[i] = top2[i,1]
     #   else: continue
-    _, adv_target = torch.min(logits, 1)
+    _, adv_target = torch.min(logits, 1)  # values, indices
     # for i in range(n):
     #   while adv_target[i] == pids[i]:
     #     adv_target[i] = random.randint(0, self.num_classes)
 
     log_probs = self.logsoftmax(logits)
-    adv_target = torch.zeros(log_probs.size()).scatter_(1, adv_target.unsqueeze(1).data.cpu(), 1)
+    adv_target = torch.zeros(log_probs.size()).scatter_(1, adv_target.unsqueeze(1).data.cpu(), 1)  # converted to one-hot
     smooth = torch.ones(log_probs.size()) / (self.num_classes-1)
-    smooth[:, pids.data.cpu()] = 0 # Pytorch1.0
+    smooth[:, pids.data.cpu()] = 0 # Pytorch1.0  # true_label:0, other:1/(n-1)
     smooth = smooth.cuda()
     if self.use_gpu: adv_target = adv_target.cuda()
     adv_target = (1 - self.epsilon) * adv_target + self.epsilon * smooth
