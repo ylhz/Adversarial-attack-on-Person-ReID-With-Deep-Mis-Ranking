@@ -2,9 +2,11 @@
 ###################
 /adv_img
 /torch_net_weight
-/__pycache__
+/*/__pycache__
+*__pycache__
 /data
 models/*/
+/logs
 
 # Compiled source #
 ###################
