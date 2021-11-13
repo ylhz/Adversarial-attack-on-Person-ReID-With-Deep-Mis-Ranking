@@ -20,7 +20,8 @@
                 "--temperature", "-1",
                 "--use_SSIM", "2",
                 "--epoch", "40",
-                "--test_batch", "5"
+                "--test_batch", "5",
+                "--gpu", "1",
             ]
         }
     ]
