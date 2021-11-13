@@ -7,7 +7,7 @@ from collections import defaultdict
 from opts import market1501_test_map, duke_test_map
 import sys
 
-def make_results(qf, gf, lqf, lgf, q_pids, g_pids, q_camids, g_camids, targetmodel, ak_typ, attr_matrix=None, dataset_name=None, attr=None):
+def make_results(qf, gf, lqf, lgf, q_pids, g_pids, q_camids, g_camids, targetmodel, ak_typ, tar_center, attr_matrix=None, dataset_name=None, attr=None, mode='clean'):
   qf, gf = featureNormalization(qf, gf, targetmodel)
   m, n = qf.size(0), gf.size(0)
   distmat = torch.pow(qf, 2).sum(dim=1, keepdim=True).expand(m, n) + torch.pow(gf, 2).sum(dim=1, keepdim=True).expand(n, m).t()
@@ -20,12 +20,16 @@ def make_results(qf, gf, lqf, lgf, q_pids, g_pids, q_camids, g_camids, targetmod
     local_distmat = low_memory_local_dist(lqf.numpy(),lgf.numpy(), aligned=True)
     distmat = local_distmat+distmat
 
-  if ak_typ > 0: 
+  if ak_typ > 0:   # attribute attack
     distmat, all_hit, ignore_list = evaluate_attr(distmat, q_pids, g_pids, attr_matrix, dataset_name, attr)
     return distmat, all_hit, ignore_list
-  else:
-    cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids, use_metric_cuhk03=False)
-    return distmat, cmc, mAP
+  else:  # non-targeted attack
+    if mode == 'clean':
+      cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids, tar_center, use_metric_cuhk03=False, mode=mode)
+      return distmat, cmc, mAP
+    elif mode == 'adv':
+      cmc, mAP, tar_cmc, tar_mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids, tar_center, use_metric_cuhk03=False, mode=mode)
+      return distmat, cmc, mAP, tar_cmc, tar_mAP
 
 def featureNormalization(qf, gf, targetmodel):
   if targetmodel in ['aligned', 'densenet121', 'hacnn', 'mudeep', 'ide', 'cam', 'lsro', 'hhl', 'spgan']:
@@ -106,63 +110,125 @@ def eval_cuhk03(distmat, q_pids, g_pids, q_camids, g_camids, max_rank, N=100):
 
     return all_cmc, mAP
 
-def eval_market1501(distmat, q_pids, g_pids, q_camids, g_camids, max_rank):
-    """Evaluation with market1501 metric
+def eval_market1501(distmat, q_pids, g_pids, q_camids, g_camids, max_rank, tar_center, mode='clean'):
+  """Evaluation with market1501 metric
     Key: for each query identity, its gallery images from the same camera view are discarded.
-    """
-    num_q, num_g = distmat.shape
-    if num_g < max_rank:
-        max_rank = num_g
-        print("Note: number of gallery samples is quite small, got {}".format(num_g))
-    indices = np.argsort(distmat, axis=1)
-    matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
 
-    # compute cmc curve for each query
-    all_cmc = []
-    all_AP = []
-    num_valid_q = 0. # number of valid query
+  Args:
+      distmat (array): Query和Gallery的距离矩阵 [q_num, g_num]
+      q_pids (array): [description]
+      g_pids ([type]): [description]
+      q_camids ([type]): [description]
+      g_camids ([type]): [description]
+      max_rank ([type]): [description]
+
+  Returns:
+      [type]: [description]
+  """
+  num_q, num_g = distmat.shape
+  if num_g < max_rank:
+      max_rank = num_g
+      print("Note: number of gallery samples is quite small, got {}".format(num_g))
+  indices = np.argsort(distmat, axis=1)
+  # 所有Query的目标pid
+  if mode == 'adv':
+    t_pids = []
     for q_idx in range(num_q):
-        # get query pid and camid
-        q_pid = q_pids[q_idx]
-        q_camid = q_camids[q_idx]
+      q_pid = q_pids[q_idx]
+      t_pids.append(tar_center[q_pid])
+    t_pids = np.asarray(t_pids)
+  # print("indices:", indices.shape)
+  # print("g_pids:", g_pids.shape, 'type:', type(g_pids))
+  # print("q_pids:", q_pids.shape, 'type:', type(q_pids))
+  # print('type:',type((g_pids[indices] == q_pids[:, np.newaxis])))
+  # 找到匹配项
+  matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
+  if mode == 'adv':
+    t_matches = (g_pids[indices] == t_pids[:, np.newaxis]).astype(np.int32)
+  
+  # compute cmc curve for each query
+  all_cmc, all_AP = [], []
+  t_all_cmc, t_all_AP = [], []
 
-        # remove gallery samples that have the same pid and camid with query
-        order = indices[q_idx]
-        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
-        keep = np.invert(remove)
+  num_valid_q = 0. # number of valid query
+  t_num_valid_q = 0. # number of valid query
 
-        # compute cmc curve
-        orig_cmc = matches[q_idx][keep] # binary vector, positions with value 1 are correct matches
-        if not np.any(orig_cmc):
-            # this condition is true when query identity does not appear in gallery
-            continue
 
-        cmc = orig_cmc.cumsum()
-        cmc[cmc > 1] = 1
+  for q_idx in range(num_q):
+      # get query pid and camid
+      q_pid = q_pids[q_idx]
+      q_camid = q_camids[q_idx]
+      
+      # remove gallery samples that have the same pid and camid with query，相同域内图为0
+      order = indices[q_idx]
+      remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
+      keep = np.invert(remove)
 
-        all_cmc.append(cmc[:max_rank])
-        num_valid_q += 1.
+      # get top 10
+      top10 = indices[q_idx][:10]  # gallery中相似度最高的top10的索引下标, 方便查找对应图片
+      top10_ = distmat[q_idx][top10][:10]
+      # get target attack pid
+      tar_pid = tar_center[q_pid]
+      if q_idx < 10  :
+        print("原始q_pid:",q_pid)
+        print("目标tar_pid:", tar_pid)
+        print("实际查询图片pid(top10):",g_pids[top10])
+
+      # compute cmc curve
+      orig_cmc = matches[q_idx][keep] # binary vector, positions with value 1 are correct matches
+
+      if not np.any(orig_cmc):
+          # this condition is true when query identity does not appear in gallery
+          continue
+
+      cmc = orig_cmc.cumsum()  # 存放TOPx的正确数目
+      cmc[cmc > 1] = 1  # rank-n 表示TOP-n中有正确结果的概率
+
+      all_cmc.append(cmc[:max_rank])
+      num_valid_q += 1.
+
+      # compute average precision
+      # reference: https://en.wikipedia.org/wiki/Evaluation_measures_(information_retrieval)#Average_precision
+      num_rel = orig_cmc.sum()  # gallery中总共正确图片数目
+      tmp_cmc = orig_cmc.cumsum()  # 存放TOPx有几个正确图
+      tmp_cmc = [x / (i+1.) for i, x in enumerate(tmp_cmc)]
+      tmp_cmc = np.asarray(tmp_cmc) * orig_cmc
+      AP = tmp_cmc.sum() / num_rel
+      all_AP.append(AP)
+      if mode == 'adv':
+        t_orig_cmc = t_matches[q_idx][keep] # binary vector, positions with value 1 are correct matches
+        
+        t_cmc = t_orig_cmc.cumsum()  # 存放TOPx的正确数目
+        t_cmc[t_cmc > 1] = 1  # rank-n 表示TOP-n中有正确结果的概率
+
+        t_all_cmc.append(t_cmc[:max_rank])
+        t_num_valid_q += 1.
 
         # compute average precision
         # reference: https://en.wikipedia.org/wiki/Evaluation_measures_(information_retrieval)#Average_precision
-        num_rel = orig_cmc.sum()
-        tmp_cmc = orig_cmc.cumsum()
-        tmp_cmc = [x / (i+1.) for i, x in enumerate(tmp_cmc)]
-        tmp_cmc = np.asarray(tmp_cmc) * orig_cmc
-        AP = tmp_cmc.sum() / num_rel
-        all_AP.append(AP)
+        t_num_rel = t_orig_cmc.sum()  # gallery中所有target图片数目
+        t_tmp_cmc = t_orig_cmc.cumsum()  # 存放TOPx有几个正确图
+        t_tmp_cmc = [x / (i+1.) for i, x in enumerate(t_tmp_cmc)]
+        t_tmp_cmc = np.asarray(t_tmp_cmc) * t_orig_cmc
+        t_AP = t_tmp_cmc.sum() / t_num_rel
+        t_all_AP.append(t_AP)
 
-    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
+  assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
 
-    all_cmc = np.asarray(all_cmc).astype(np.float32)
-    all_cmc = all_cmc.sum(0) / num_valid_q
-    mAP = np.mean(all_AP)
+  all_cmc = np.asarray(all_cmc).astype(np.float32)
+  all_cmc = all_cmc.sum(0) / num_valid_q
+  mAP = np.mean(all_AP)
+  if mode == 'adv':
+    t_all_cmc = np.asarray(t_all_cmc).astype(np.float32)
+    t_all_cmc = t_all_cmc.sum(0) / num_valid_q
+    t_mAP = np.mean(t_all_AP)
+    return all_cmc, mAP, t_all_cmc, t_mAP
 
-    return all_cmc, mAP
+  return all_cmc, mAP
 
-def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=20, use_metric_cuhk03=False):
+def evaluate(distmat, q_pids, g_pids, q_camids, g_camids, tar_center, max_rank=20, use_metric_cuhk03=False, mode='clean'):
   if use_metric_cuhk03: return eval_cuhk03(distmat, q_pids, g_pids, q_camids, g_camids, max_rank)
-  else: return eval_market1501(distmat, q_pids, g_pids, q_camids, g_camids, max_rank)
+  else: return eval_market1501(distmat, q_pids, g_pids, q_camids, g_camids, max_rank, tar_center, mode=mode)
 
 def evaluate_attr(distmat, q_pids, g_pids, attr_matrix, dataset_name, attr_list, max_rank=20):
   attr_key, attr_value = attr_list

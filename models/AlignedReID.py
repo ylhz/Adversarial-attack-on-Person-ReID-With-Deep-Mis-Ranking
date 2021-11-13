@@ -41,7 +41,7 @@ class ResNet50(nn.Module):
       lf = lf.view(lf.size()[0:3])
       lf = lf / torch.pow(lf,2).sum(dim=1, keepdim=True).clamp(min=1e-12).sqrt()
     x = F.avg_pool2d(x, x.size()[2:])
-    f = x.view(x.size(0), -1)
+    f = x.view(x.size(0), -1)  # feature:N*
     #f = 1. * f / (torch.norm(f, 2, dim=-1, keepdim=True).expand_as(f) + 1e-12)
     if not is_training:
       return [f,lf]

@@ -59,12 +59,12 @@ class adv_CrossEntropyLabelSmooth(nn.Module):
     #     adv_target[i] = random.randint(0, self.num_classes)
 
     log_probs = self.logsoftmax(logits)
-    adv_target = torch.zeros(log_probs.size()).scatter_(1, adv_target.unsqueeze(1).data.cpu(), 1)  # converted to one-hot
+    adv_target = torch.zeros_like(log_probs).scatter_(1, adv_target.unsqueeze(1).data, 1)  # converted to one-hot
     smooth = torch.ones_like(log_probs) / (self.num_classes-1)
     smooth[:, pids.data] = 0 # Pytorch1.0  # true_label:0, other:1/(n-1)
     # smooth = smooth.cuda()
-    if self.use_gpu: adv_target = adv_target.cuda()
-    adv_target = (1 - self.epsilon) * adv_target + self.epsilon * smooth
+    # if self.use_gpu: adv_target = adv_target.cuda()
+    adv_target = (1 - self.epsilon) * adv_target + self.epsilon * smooth  # soft label
     loss = (- adv_target * log_probs).mean(0).sum()
     return torch.log(loss)
 
@@ -84,19 +84,22 @@ class adv_TripletLoss(nn.Module):
       """
       n = features.size(0)
 
+      # print(features.shape)
+      # print(torch.pow(features, 2).sum(dim=1, keepdim=True).shape)
+      # input()
       dist = torch.pow(features, 2).sum(dim=1, keepdim=True).expand(n, n)
       dist = dist + dist.t()
       dist.addmm_(1, -2, features, features.t())
       dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
 
-      if self.ak_type < 0: 
+      if self.ak_type < 0:   # non-targeted attack
         mask = pids.expand(n, n).eq(pids.expand(n, n).t())
         dist_ap, dist_an = [], []
         for i in range(n):
           dist_an.append(dist[i][mask[i]].min().unsqueeze(0)) # make nearest pos-pos far away
           dist_ap.append(dist[i][mask[i] == 0].max().unsqueeze(0)) # make hardest pos-neg closer
 
-      elif self.ak_type > 0: 
+      elif self.ak_type > 0:   # attribute attck
         p = []
         for i in range(n):
           p.append(pids[i].item())

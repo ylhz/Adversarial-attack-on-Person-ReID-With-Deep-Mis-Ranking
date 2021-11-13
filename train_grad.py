@@ -8,8 +8,10 @@ import os
 import numpy as np
 import os.path as osp
 import math
-from random import sample 
+from random import sample
+from numpy.lib.function_base import append 
 from scipy import io
+from tqdm import tqdm
 
 import torchvision
 import torch
@@ -21,7 +23,7 @@ import torch.backends.cudnn as cudnn
 import models
 from models.PCB import PCB_test
 # from ReID_attr import get_target_withattr # Need Attribute file
-from opts import get_opts, Imagenet_mean, Imagenet_stddev
+from opts_our import get_opts, Imagenet_mean, Imagenet_stddev
 from GD import Generator, MS_Discriminator, Pat_Discriminator, GANLoss, weights_init
 from advloss import DeepSupervision, adv_CrossEntropyLoss, adv_CrossEntropyLabelSmooth, adv_TripletLoss
 from util import data_manager
@@ -30,7 +32,8 @@ from util.utils import fliplr, Logger, save_checkpoint, visualize_ranked_results
 from util.eval_metrics import make_results
 from util.samplers import RandomIdentitySampler, AttrPool
 
-from attack import attack
+# from utils.cluster import KMEANS
+from attack import attack, save_imgs, normalize, get_all_feature, get_feature_center, get_target
 
 # Training settings
 parser = argparse.ArgumentParser(description='adversarial attack')
@@ -39,6 +42,7 @@ parser.add_argument('--targetmodel', type=str, default='aligned', choices=models
 parser.add_argument('--dataset', type=str, default='market1501', choices=data_manager.get_names())
 parser.add_argument('--gpu', type=str, default='0', help="gpu idx")
 
+parser.add_argument('--eps', type=int, default=16, help='epslion')
 # PATH
 parser.add_argument('--G_resume_dir', type=str, default='', metavar='path to resume G')
 parser.add_argument('--pre_dir', type=str, default='models', help='path to be attacked model')
@@ -87,7 +91,8 @@ if args.attr_dir:
 
 pre_dir = osp.join(args.pre_dir, args.targetmodel, args.dataset+'.pth.tar')
 save_dir = osp.join(args.save_dir, args.targetmodel, args.dataset, args.ablation)
-vis_dir = osp.join(args.vis_dir, args.targetmodel, args.dataset, args.ablation)
+vis_dir = osp.join(args.vis_dir, args.targetmodel, args.dataset, 'adv_eps{}'.format(args.eps),args.ablation)
+# vis_dir = osp.join(args.vis_dir, args.targetmodel, args.dataset, 'ori', args.ablation)
 
 
 def main(opt):
@@ -105,9 +110,11 @@ def main(opt):
 
     if use_gpu:
         print("GPU mode")
+        device = torch.device("cuda:0")
         cudnn.benchmark = True
         torch.cuda.manual_seed(args.seed)
     else:
+        device = torch.device("cpu")
         print("CPU mode")
 
     ### Setup dataset loader ###
@@ -130,6 +137,10 @@ def main(opt):
 
     ### Prepare pretrained model ###
     target_net = models.init_model(name=args.targetmodel, pre_dir=pre_dir, num_classes=dataset.num_train_pids)
+    # target_net = nn.Sequential(
+    #     Normalize(mean=Imagenet_mean, std=Imagenet_stddev, mode='torch'),
+    #     models.init_model(name=args.targetmodel, pre_dir=pre_dir, num_classes=dataset.num_train_pids),
+    # )
     check_freezen(target_net, need_modified=True, after_modified=False)
 
     ### Prepare main net ###
@@ -148,224 +159,113 @@ def main(opt):
     if use_gpu: 
         test_target_net = nn.DataParallel(target_net).cuda() if not args.targetmodel == 'pcb' else nn.DataParallel(PCB_test(target_net)).cuda()
         target_net = nn.DataParallel(target_net).cuda() 
-        G = nn.DataParallel(G).cuda()
-        D = nn.DataParallel(D).cuda()
 
-    if args.mode == 'test':
-        epoch = 'test'
-        test(G, D, test_target_net, dataset, queryloader, galleryloader, epoch, use_gpu, is_test=True)
-        return 0
+    # ToDO:
+    # 0. 把所有Query的特征向量提取出来
+    ori_features, ori_pids = get_all_feature(queryloader, test_target_net, args.targetmodel)
+    # 1. 先把Query所有图片进行聚类，每个PID找到各自聚类中心
+    # kmeans = KMEANS(max_iter=20,verbose=False,device=device)
+    # tmp = kmeans.fit(queryloader)
+    center = get_feature_center(ori_features, ori_pids)  # dict: key=PID, value=feature
+    # 2. 找到距离最近的错误类作为攻击目标
+    tar_center = get_target(center)  # dict:key=pid, value=target pid  # 这个有点耗时
+    ########################
+    ###start attack
+    ########################
 
-    # Ready
     start_time = time.time()
     train_time = 0
-    worst_mAP, worst_rank1, worst_rank5, worst_rank10, worst_epoch = np.inf, np.inf, np.inf, np.inf, 0
-    best_hit, best_epoch = -np.inf, 0
-    print("==> Start training")
-
-    for epoch in range(1,args.epoch+1):
-        start_train_time = time.time()
-        train(epoch, G, D, target_net, criterionGAN, clf_criterion, metric_criterion, optimizer_G, optimizer_D, trainloader, use_gpu)
-        train_time += round(time.time() - start_train_time)
-
-        if epoch % args.eval_freq == 0:
-            print("==> Eval at epoch {}".format(epoch))
-            if args.ak_type < 0:
-                cmc, mAP = test(G, D, test_target_net, dataset, queryloader, galleryloader, epoch, use_gpu, is_test=False)
-                is_worst = cmc[0]<=worst_rank1 and cmc[1]<=worst_rank5 and cmc[2]<=worst_rank10 and mAP<=worst_mAP
-                if is_worst: 
-                    worst_mAP, worst_rank1, worst_epoch = mAP, cmc[0], epoch
-                print("==> Worst_epoch is {}, Worst mAP {:.1%}, Worst rank-1 {:.1%}".format(worst_epoch, worst_mAP, worst_rank1))
-                save_checkpoint(G.state_dict(), is_worst, 'G', osp.join(save_dir, 'G_ep' + str(epoch) + '.pth.tar'))
-                save_checkpoint(D.state_dict(), is_worst, 'D', osp.join(save_dir, 'D_ep' + str(epoch) + '.pth.tar'))
-
-            else: 
-                all_hits = test(G, D, target_net, dataset, queryloader, galleryloader, epoch, use_gpu, is_test=False)
-                is_best = all_hits[0]>=best_hit
-                if is_best: 
-                    best_hit, best_epoch = all_hits[0], epoch
-                print("==> Best_epoch is {}, Best rank-1 {:.1%}".format(best_epoch, best_hit))
-                save_checkpoint(G.state_dict(), is_best, 'G', osp.join(save_dir, 'G_ep' + str(epoch) + '.pth.tar'))
-                save_checkpoint(D.state_dict(), is_best, 'D', osp.join(save_dir, 'D_ep' + str(epoch) + '.pth.tar'))
-
-    elapsed = round(time.time() - start_time)
-    elapsed = str(datetime.timedelta(seconds=elapsed))
-    train_time = str(datetime.timedelta(seconds=train_time))
-    print("Finished. Total elapsed time (h:m:s): {}. Training time (h:m:s): {}.".format(elapsed, train_time))
-
-def train(epoch, G, D, target_net, criterionGAN, clf_criterion, metric_criterion, optimizer_G, optimizer_D, trainloader, use_gpu):
-    G.train()
-    D.train()
-    global is_training
-    is_training = True
-
-    for batch_idx, (imgs, pids, _, pids_raw) in enumerate(trainloader):
-        if use_gpu: 
-            imgs, pids, pids_raw = imgs.cuda(), pids.cuda(), pids_raw.cuda()
-
-        new_imgs, mask = perturb(imgs, G, D, train_or_test='train')
-        new_imgs = new_imgs.cuda()
-        mask = mask.cuda()
-        # Fake Detection and Loss
-        pred_fake_pool, _ = D(torch.cat((imgs, new_imgs.detach()), 1))
-        loss_D_fake = criterionGAN(pred_fake_pool, False)                
-
-        # Real Detection and Loss
-        num = args.train_batch//2
-        pred_real, _ = D(torch.cat((imgs[0:num,:,:,:], imgs[num:,:,:,:].detach()), 1))
-        loss_D_real = criterionGAN(pred_real, True)
-
-        # GAN loss (Fake Passability Loss)
-        pred_fake, _ = D(torch.cat((imgs, new_imgs), 1))                
-        loss_G_GAN = criterionGAN(pred_fake, True)                             
-        
-        # Re-ID advloss
-        ls = target_net(new_imgs, is_training)
-        if len(ls) == 1: new_outputs = ls[0]
-        if len(ls) == 2: new_outputs, new_features = ls
-        if len(ls) == 3: new_outputs, new_features, new_local_features = ls
-        xent_loss, global_loss, loss_G_ssim = 0, 0, 0
-        targets = None
-
-        if args.loss in ['cent', 'xent', 'xent_htri']:
-            if args.ak_type < 0:    # non-targeted attack
-                xent_loss = DeepSupervision(clf_criterion, new_outputs, pids) if isinstance(new_features, (tuple, list)) else clf_criterion(new_outputs, pids)
-
-            elif args.ak_type > 0:    # attribute attack
-                targets = get_target_withattr(attr_matrix, args.dataset, attr_list, pids, pids_raw).float().cuda()
-                xent_loss = 0#DeepSupervision(clf_criterion, new_outputs, targets) if isinstance(new_features, (tuple, list)) else clf_criterion(new_outputs, targets)
-
-        if args.loss in ['htri', 'xent_htri']:
-            assert len(ls) >= 2 
-            global_loss = DeepSupervision(metric_criterion, new_features, z, targets) if isinstance(new_features, (tuple, list)) else metric_criterion(new_features, pids, targets)
-        
-        loss_G_ReID = (xent_loss+ global_loss)*opt['ReID_factor'] 
-
-        # # SSIM loss
-        if not args.use_SSIM == 0:
-            from util.ms_ssim import msssim, ssim
-            loss_func = msssim if args.use_SSIM == 2 else ssim
-            loss_G_ssim = (1-loss_func(imgs, new_imgs))*0.1
-
-        ############## Forward ###############
-        loss_D = (loss_D_fake + loss_D_real)/2
-        loss_G = loss_G_GAN + loss_G_ReID + loss_G_ssim
-        ############## Backward #############
-        # update generator weights
-        optimizer_G.zero_grad()
-        # loss_G.backward(retain_graph=True)
-        loss_G.backward()
-        optimizer_G.step()
-        # update discriminator weights
-        optimizer_D.zero_grad()
-        loss_D.backward()
-        optimizer_D.step()
-        if (batch_idx+1) % args.print_freq == 0:
-            print("===> Epoch[{}]({}/{}) loss_D: {:.4f} loss_G_GAN: {:.4f} loss_G_ReID: {:.4f} loss_G_SSIM: {:.4f}".format(epoch, batch_idx, len(trainloader), loss_D.item(), loss_G_GAN.item(), loss_G_ReID.item(), loss_G_ssim))
-
-def test(G, D, target_net, dataset, queryloader, galleryloader, epoch, use_gpu, is_test=False, ranks=[1, 5, 10, 20]):
-    global is_training
-    is_training = False
-    if args.mode == 'test' and args.G_resume_dir:
-        G_resume_dir, D_resume_dir = args.G_resume_dir, args.G_resume_dir.replace('G', 'D')
-        G_checkpoint, D_checkpoint = torch.load(G_resume_dir), torch.load(D_resume_dir)
-        G_state_dict = G_checkpoint['state_dict'] if isinstance(G_checkpoint, dict) and 'state_dict' in G_checkpoint else G_checkpoint
-        D_state_dict = D_checkpoint['state_dict'] if isinstance(D_checkpoint, dict) and 'state_dict' in D_checkpoint else D_checkpoint
-
-        G.load_state_dict(G_state_dict)
-        D.load_state_dict(D_state_dict)
-        print("Sucessfully, loading {} and {}".format(G_resume_dir, D_resume_dir))
-
-        #######################
-        # 基于梯度，因此放到外面来
-        ######################
-        # for batch_idx, (imgs, pids, _, pids_raw) in enumerate(queryloader):
-            
-        #     # attack
-        #     adv_imgs = attack(imgs, pids, target_net)
-            
-        #     # save
-        #     save_imgs(adv_imgs, output_dir)
-            
-        #     # test
-        #     with torch.no_grad():
-        #         qf = extract(adv_imgs)
-        #         # test query img top10 pid
-        #         # accuracy
-        
-        # print total accuracy
-            
-            
-
-        
-
+    ranks = [1, 5, 10, 20]
     with torch.no_grad():
+        print("get features of all gallery images:")
+        gf, lgf, g_pids, g_camids = extract_and_perturb(galleryloader, target_net, use_gpu, query_or_gallery='gallery') # cpu
+
+
+    qf, lqf, new_qf, new_lqf, q_pids, tar_pids, q_camids = [], [], [], [], [], [], []
+    for batch_idx, (imgs, pids, camids, pids_raw) in enumerate(tqdm(queryloader)):
         
-        qf, lqf, new_qf, new_lqf, q_pids, q_camids = extract_and_perturb(queryloader, G, D, target_net, use_gpu, query_or_gallery='query', is_test=is_test, epoch=epoch)
-        gf, lgf, g_pids, g_camids = extract_and_perturb(galleryloader, G, D, target_net, use_gpu, query_or_gallery='gallery', is_test=is_test, epoch=epoch)
+        imgs = imgs.cuda()
 
-        if args.ak_type > 0: 
-            distmat, hits, ignore_list = make_results(new_qf, gf, new_lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, attr_matrix, args.dataset, attr_list)
-            print("Hits rate, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(ranks[0], hits[ranks[0]-1], ranks[1], hits[ranks[1]-1], ranks[2], hits[ranks[2]-1], ranks[3], hits[ranks[3]-1]))
-            if not is_test:
-                return hits
+        # attack
+        adv_imgs = attack(imgs, pids, test_target_net, center, tar_center, args.targetmodel, eps=args.eps, iter_num=10)
+        
+        # save
+        save_imgs(adv_imgs, pids, batch_idx, vis_dir)
+        
+        # test
+        with torch.no_grad():
+            
+            ls = extract(imgs, test_target_net)
+            new_ls = extract(adv_imgs, test_target_net)
+            if len(ls) == 1: 
+                features = ls[0]
+                new_features = new_ls[0]
+            if len(ls) == 2: 
+                features, local_features = ls    # []  
+                new_features, new_local_features = new_ls    # []
+                lqf.append(local_features.clone().detach().data)
+                new_lqf.append(new_local_features.clone().detach().data)
+            qf.append(features.clone().detach().data)
+            new_qf.append(new_features.clone().detach().data)
+            q_pids.extend(pids)
+            q_camids.extend(camids)
 
-        else:     # non-targeted
-            if is_test:
-                distmat, cmc, mAP = make_results(qf, gf, lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type)
-                input()
-                print("****"*10)
-                print("new:")
-                new_distmat, new_cmc, new_mAP = make_results(new_qf, gf, new_lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type)
-                print("Results ----------")
-                print("Before, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(mAP, ranks[0], cmc[ranks[0]-1], ranks[1], cmc[ranks[1]-1], ranks[2], cmc[ranks[2]-1], ranks[3], cmc[ranks[3]-1]))
-                print("After , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(new_mAP, ranks[0], new_cmc[ranks[0]-1], ranks[1], new_cmc[ranks[1]-1], ranks[2], new_cmc[ranks[2]-1], ranks[3], new_cmc[ranks[3]-1]))
-                if args.usevis: 
-                    visualize_ranked_results(distmat, dataset, save_dir=osp.join(vis_dir, 'origin_results'), topk=20)
-                if args.usevis: 
-                    visualize_ranked_results(new_distmat, dataset, save_dir=osp.join(vis_dir, 'polluted_results'), topk=20)
-            else:
-                _, new_cmc, new_mAP = make_results(new_qf, gf, new_lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type)
-                print("mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(new_mAP, ranks[0], new_cmc[ranks[0]-1], ranks[1], new_cmc[ranks[1]-1], ranks[2], new_cmc[ranks[2]-1], ranks[3], new_cmc[ranks[3]-1]))
-                return new_cmc, new_mAP
+    qf = torch.cat(qf, 0)
+    new_qf = torch.cat(new_qf, 0)
+    if not lqf == []: lqf = torch.cat(lqf, 0)
+    if not new_lqf == []: new_lqf = torch.cat(new_lqf, 0)
+    q_pids, q_camids = np.asarray(q_pids), np.asarray(q_camids)
 
-def extract_and_perturb(loader, G, D, target_net, use_gpu, query_or_gallery, is_test, epoch):
+    # result
+    print("查询干净图片")
+    distmat, cmc, mAP, t_cmc, t_mAP = make_results(qf.cpu(), gf.cpu(), lqf.cpu(), lgf.cpu(), q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, tar_center, mode='adv')
+    print("查询对抗样本图片")
+    new_distmat, new_cmc, new_mAP, t_new_cmc, t_new_mAP = make_results(new_qf, gf, new_lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, tar_center, mode='adv')
+    # print("查询对抗样本目标攻击图片")
+    # tar_distmat, tar_cmc, tar_mAP = make_results(new_qf, gf, new_lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, tar_center)
+    print("Results ----------")
+    print("Before  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(mAP, ranks[0], cmc[ranks[0]-1], ranks[1], cmc[ranks[1]-1], ranks[2], cmc[ranks[2]-1], ranks[3], cmc[ranks[3]-1]))
+    print("t_Before, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_mAP, ranks[0], t_cmc[ranks[0]-1], ranks[1], t_cmc[ranks[1]-1], ranks[2], t_cmc[ranks[2]-1], ranks[3], t_cmc[ranks[3]-1]))
+    print("After  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(new_mAP, ranks[0], new_cmc[ranks[0]-1], ranks[1], new_cmc[ranks[1]-1], ranks[2], new_cmc[ranks[2]-1], ranks[3], new_cmc[ranks[3]-1]))            
+    print("t_After, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_new_mAP, ranks[0], t_new_cmc[ranks[0]-1], ranks[1], t_new_cmc[ranks[1]-1], ranks[2], t_new_cmc[ranks[2]-1], ranks[3], t_new_cmc[ranks[3]-1]))            
+
+    
+
+    # elapsed = round(time.time() - start_time)
+    # elapsed = str(datetime.timedelta(seconds=elapsed))
+    # train_time = str(datetime.timedelta(seconds=train_time))
+    # print("Finished. Total elapsed time (h:m:s): {}. Training time (h:m:s): {}.".format(elapsed, train_time))
+
+
+    # if (batch_idx+1) % args.print_freq == 0:
+    #     print("===> Epoch[{}]({}/{}) loss_D: {:.4f} loss_G_GAN: {:.4f} loss_G_ReID: {:.4f} loss_G_SSIM: {:.4f}".format(epoch, batch_idx, len(trainloader), loss_D.item(), loss_G_GAN.item(), loss_G_ReID.item(), loss_G_ssim))
+
+def extract_features(imgs, target_net):
+    ls = extract(imgs, target_net)
+    if len(ls) == 1: features = ls[0]
+    if len(ls) == 2: features, local_features = ls    # []
+        # lf.append(local_features.detach().data.cpu())     
+
+    # f.append(features.detach().data.cpu())
+    return [features, local_features]
+
+
+
+def extract_and_perturb(loader, target_net, use_gpu, query_or_gallery):
     f, lf, new_f, new_lf, l_pids, l_camids = [], [], [], [], [], []
     ave_mask, num = 0, 0
-    for batch_idx, (imgs, pids, camids, pids_raw) in enumerate(loader):
+    for batch_idx, (imgs, pids, camids, pids_raw) in enumerate(tqdm(loader)):
         if use_gpu: 
             imgs = imgs.cuda()
         ls = extract(imgs, target_net)
         if len(ls) == 1: features = ls[0]
         if len(ls) == 2: 
             features, local_features = ls    # []
-            lf.append(local_features.detach().data.cpu())
+            lf.append(local_features.detach().data)
 
-        # print('features:',features.shape)
-        # print('local_feature', local_features.shape)
-        # print("stop")
-        # input()
-        f.append(features.detach().data.cpu())
+        f.append(features.detach().data)
         l_pids.extend(pids)
         l_camids.extend(camids)
-
-        if query_or_gallery == 'query':
-            G.eval()
-            D.eval()
-            new_imgs, delta, mask = perturb(imgs, G, D, train_or_test='test')
-            ave_mask += torch.sum(mask.detach()).cpu().numpy()
-            num += imgs.size(0)
-
-            ls = extract(new_imgs, target_net)
-            if len(ls) == 1: new_features = ls[0]
-            if len(ls) == 2: 
-                new_features, new_local_features = ls
-                new_lf.append(new_local_features.detach().data.cpu())
-            new_f.append(new_features.detach().data.cpu())
-
-            ls = [imgs, new_imgs, delta, mask]
-            if is_test: 
-                save_img(ls, pids, camids, epoch, batch_idx)
 
     f = torch.cat(f, 0)
     if not lf == []: lf = torch.cat(lf, 0)
@@ -382,12 +282,10 @@ def extract_and_perturb(loader, G, D, target_net, use_gpu, query_or_gallery, is_
 
 def extract(imgs, target_net):
     if args.targetmodel in ['pcb', 'lsro']:
-        ls = [target_net(imgs, is_training)[0] + target_net(fliplr(imgs), is_training)[0]]
+        ls = [target_net(normalize(imgs), is_training)[0] + target_net(normalize(fliplr(imgs)), is_training)[0]]
     else: 
-        ls = target_net(imgs, is_training)
+        ls = target_net(normalize(imgs), is_training)
     for i in range(len(ls)): ls[i] = ls[i].data.cpu()
-    # print('is_training:',is_training)
-    # print('test features:', ls[1].shape)
     return ls
 
 def perturb(imgs, G, D, train_or_test='test'):
@@ -427,7 +325,7 @@ def L_norm(delta, mode='train'):
                 break
     return delta
 
-def save_img(ls, pids, camids, epoch, batch_idx):
+def save_img_del(ls, pids, camids, epoch, batch_idx):
     image, new_image, delta, mask = ls
     # undo normalize image color channels
     delta_tmp = torch.zeros(delta.size())
