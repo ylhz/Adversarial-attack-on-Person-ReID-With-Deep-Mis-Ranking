@@ -43,6 +43,7 @@ parser.add_argument('--dataset', type=str, default='market1501', choices=data_ma
 parser.add_argument('--gpu', type=str, default='0', help="gpu idx")
 
 parser.add_argument('--eps', type=int, default=16, help='epslion')
+parser.add_argument('--iter_num', type=int, default=10, help='迭代次数')
 # PATH
 parser.add_argument('--G_resume_dir', type=str, default='', metavar='path to resume G')
 parser.add_argument('--pre_dir', type=str, default='models', help='path to be attacked model')
@@ -187,7 +188,7 @@ def main(opt):
         imgs = imgs.cuda()
 
         # attack
-        adv_imgs = attack(imgs, pids, test_target_net, center, tar_center, args.targetmodel, eps=args.eps, iter_num=10)
+        adv_imgs = attack(imgs, pids, test_target_net, center, tar_center, args.targetmodel, eps=args.eps, iter_num=args.iter_num)
         
         # save
         save_imgs(adv_imgs, pids, batch_idx, vis_dir)
@@ -226,8 +227,8 @@ def main(opt):
     print("Results ----------")
     print("Before  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(mAP, ranks[0], cmc[ranks[0]-1], ranks[1], cmc[ranks[1]-1], ranks[2], cmc[ranks[2]-1], ranks[3], cmc[ranks[3]-1]))
     print("t_Before, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_mAP, ranks[0], t_cmc[ranks[0]-1], ranks[1], t_cmc[ranks[1]-1], ranks[2], t_cmc[ranks[2]-1], ranks[3], t_cmc[ranks[3]-1]))
-    print("After  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(new_mAP, ranks[0], new_cmc[ranks[0]-1], ranks[1], new_cmc[ranks[1]-1], ranks[2], new_cmc[ranks[2]-1], ranks[3], new_cmc[ranks[3]-1]))            
-    print("t_After, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_new_mAP, ranks[0], t_new_cmc[ranks[0]-1], ranks[1], t_new_cmc[ranks[1]-1], ranks[2], t_new_cmc[ranks[2]-1], ranks[3], t_new_cmc[ranks[3]-1]))            
+    print("After  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(new_mAP, ranks[0], new_cmc[ranks[0]-1], ranks[1], new_cmc[ranks[1]-1], ranks[2], new_cmc[ranks[2]-1], ranks[3], new_cmc[ranks[3]-1]))
+    print("t_After, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_new_mAP, ranks[0], t_new_cmc[ranks[0]-1], ranks[1], t_new_cmc[ranks[1]-1], ranks[2], t_new_cmc[ranks[2]-1], ranks[3], t_new_cmc[ranks[3]-1]))
 
     
 

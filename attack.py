@@ -320,8 +320,8 @@ def get_target(pid_center):
         return d    
     tar_pids = {}
     len_pid = len(pid_center.keys())
-    # pid_dist = torch.full([len_pid, len_pid], torch.tensor(float('inf')))  # 找最近的错误类
-    pid_dist = torch.full([len_pid, len_pid], torch.tensor(0))  # 找最远的错误类
+    pid_dist = torch.full([len_pid, len_pid], torch.tensor(float('inf')))  # 找最近的错误类
+    # pid_dist = torch.full([len_pid, len_pid], torch.tensor(0))  # 找最远的错误类
     pid_keys = list(pid_center.keys())
     pid_values = list(pid_center.values())
     for i in range(len_pid):
@@ -329,7 +329,9 @@ def get_target(pid_center):
             pid_dist[i,j] = distance(pid_values[i], pid_values[j])
             pid_dist[j,i] = pid_dist[i,j]
     for i in range(len_pid):
+        idx_sort = torch.argsort(pid_dist[i])  # 升序排列的索引
+        idx = idx_sort[9]  # 选取距离Top10的非同类作为攻击目标
         # idx = torch.argmin(pid_dist[i])  # 找最近的错误类
-        idx = torch.argmax(pid_dist[i])  # 找最远的错误类
+        # idx = torch.argmax(pid_dist[i])  # 找最远的错误类
         tar_pids[pid_keys[i]] = pid_keys[idx]
     return tar_pids
