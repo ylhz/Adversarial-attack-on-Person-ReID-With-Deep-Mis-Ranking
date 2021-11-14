@@ -123,13 +123,23 @@ python train.py \
   --temperature=-1 \
   --use_SSIM=2 \
   --epoch=40
+
+CUDA_VISIBLE_DEVICES=1 python train.py \
+  --targetmodel='cam' \
+  --dataset='dukemtmcreid'\
+  --mode='train' \
+  --loss='xent_htri' \
+  --ak_type=-1 \
+  --temperature=-1 \
+  --use_SSIM=2 \
+  --epoch=40
 ```
 
 # Test
 Take attacking AlignedReID trained on Market1501 as an example:
 
 ```bash
-python train.py \
+CUDA_VISIBLE_DEVICES=0 python train.py \
   --targetmodel='aligned' \
   --dataset='market1501'\
   --G_resume_dir='./logs/aligned/market1501/best_G.pth.tar' \
@@ -138,8 +148,23 @@ python train.py \
   --ak_type=-1 \
   --temperature=-1 \
   --use_SSIM=2 \
+  --test_batch=5 \
+  --epoch=40
+
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --targetmodel='cam' \
+  --dataset='dukemtmcreid'\
+  --G_resume_dir='./logs/cam/dukemtmcreid/best_G.pth.tar' \
+  --mode='test' \
+  --loss='xent_htri' \
+  --ak_type=-1 \
+  --temperature=-1 \
+  --use_SSIM=2 \
+  --test_batch=5 \
   --epoch=40
 ```
+
+
 
 # Results
 
