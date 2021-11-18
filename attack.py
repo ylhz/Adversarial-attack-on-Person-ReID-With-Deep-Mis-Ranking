@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.autograd import Variable as V
 
 import os
+import numpy as np
 from tqdm import tqdm
 
 from util.utils import fliplr
@@ -62,8 +63,9 @@ class adv_TripletLoss(nn.Module):
         center_dist = self.distance(adv_features, c_features).sum()/n  # max
         tar_dist = self.distance(adv_features, tar_features).sum()/n  # min
         # print("adv_dist:", adv_dist, "center_dist", center_dist, "tar_dist", tar_dist)
+        loss = (tar_dist - adv_dist) / 2  # loss最小化
         # loss = (tar_dist - 0.5*center_dist - 0.5*adv_dist) / 2  # loss最小化
-        loss = tar_dist  # loss最小化
+        # loss = tar_dist  # loss最小化
         return loss
 
     # def forward_old(self, adv_features, ori_features, pids, target_pids):
@@ -138,6 +140,62 @@ def get_target_pids(features, pids):
     # target_pids[target_pids>self.pids_max] = 1
     return target_pids.detach()
 
+# 基于梯度的攻击方法
+# PI
+# 原论文的PT卷积
+def project_kern(kern_size):
+    kern = np.ones((kern_size, kern_size), dtype=np.float32) / (kern_size ** 2 - 1)
+    kern[kern_size // 2, kern_size // 2] = 0.0
+    kern = kern.astype(np.float32)
+    stack_kern = np.stack([kern, kern, kern])  # 连接多个矩阵，axis=0
+    stack_kern = np.expand_dims(stack_kern, 1)  # 扩充维度
+    stack_kern = torch.tensor(stack_kern).cuda()
+    return stack_kern, kern_size // 2
+
+def project_noise(x, kern_size=3):
+    # x = tf.pad(x, [[0,0],[kern_size,kern_size],[kern_size,kern_size],[0,0]], "CONSTANT")
+    # (input, weight, padding, groups)
+    # weight:(outchannel, inchannel/groups, kH, kW)
+    stack_kern, padding_size = project_kern(kern_size)
+    x = nn.functional.conv2d(x, stack_kern, padding = (padding_size, padding_size), groups=3)
+    return x
+
+# TI
+# 创建一个高斯核2（中间大，周围小，对称性，和为1）
+def creat_gauss_kernel(kern_size=21, nsig=3):
+    """Returns a 2D Gaussian kernel array."""
+    import scipy.stats as st
+
+    x = np.linspace(-nsig, nsig, kern_size)
+    kern1d = st.norm.pdf(x)
+    kernel_raw = np.outer(kern1d, kern1d)
+    kernel = kernel_raw / kernel_raw.sum()
+    kernel = kernel.astype(np.float32)
+
+    stack_kernel = np.stack([kernel, kernel, kernel])
+    stack_kernel = np.expand_dims(stack_kernel, 1)
+    return torch.tensor(stack_kernel)
+
+class GaussianBlurConv(nn.Module):
+    """stride=1时kernel_size只能为奇数,注意Re-ID的长宽不相等，需要分别考虑
+    """
+
+    def __init__(self, kernel_size=21, stride=1, channels=3):
+        super(GaussianBlurConv, self).__init__()
+        self.kern_size = kernel_size
+        self.stride = stride
+        self.channels = channels
+        kernel = creat_gauss_kernel(kern_size=self.kern_size).cuda()
+        self.weight = nn.Parameter(data=kernel, requires_grad=False)
+
+    def __call__(self, x):
+        x_height = x.shape[2]
+        x_width = x.shape[3]
+        h_padding = int(((x_height - 1) * self.stride + self.kern_size - x_height)/2)  # 使用padding保证输入和输出大小一致
+        w_padding = int(((x_width - 1) * self.stride + self.kern_size - x_width)/2)  # 使用padding保证输入和输出大小一致
+        x = nn.functional.conv2d(x, self.weight, stride=self.stride,
+                     padding=(h_padding, w_padding), groups=self.channels)
+        return x
 
 def attack(imgs, pids, target_net, center, tar_center, net_name, eps, iter_num):
     """攻击函数
@@ -161,8 +219,13 @@ def attack(imgs, pids, target_net, center, tar_center, net_name, eps, iter_num):
     momentum = 0.9
     get_adv_loss = adv_TripletLoss()
     noise = torch.zeros_like(imgs, requires_grad=True)
+    # PI
+    amplification = 10
+    alpha_beta = alpha * amplification
+    gamma = alpha_beta
     
     old_grad =0.0
+    amplification = 0.0
     for i in range(iter_num):
         adv_imgs = imgs + noise
         # ls = target_net(adv_imgs, is_training)
@@ -193,7 +256,20 @@ def attack(imgs, pids, target_net, center, tar_center, net_name, eps, iter_num):
         grad = momentum * old_grad + grad
         old_grad = grad
 
-        noise = noise - alpha * torch.sign(grad)
+        # TI-FGSM
+        Gauss_kernel = GaussianBlurConv(kernel_size=5)
+        Gauss_kernel = Gauss_kernel.cuda()
+        grad = Gauss_kernel(grad)
+        # PI-FGSM
+        amplification += alpha_beta * torch.sign(grad)
+        cut_noise = torch.clamp(abs(amplification) - eps, 0, 10000.0) * torch.sign(amplification)
+        # projection = gamma * torch.sign(project_noise(cut_noise, stack_kern, padding_size))
+        projection = gamma * torch.sign(project_noise(cut_noise, 7))
+
+        amplification += projection
+        noise = noise - alpha_beta * torch.sign(grad) - projection
+
+        # noise = noise - alpha * torch.sign(grad)
 
         # avoid of bound
         # 先对noise标准化
@@ -205,7 +281,7 @@ def attack(imgs, pids, target_net, center, tar_center, net_name, eps, iter_num):
 
     return adv_imgs.detach()
 
-    distmat, hits, ignore_list = make_results(new_qf, gf, new_lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, attr_matrix, args.dataset, attr_list)
+
 
 
     
@@ -335,3 +411,4 @@ def get_target(pid_center):
         # idx = torch.argmax(pid_dist[i])  # 找最远的错误类
         tar_pids[pid_keys[i]] = pid_keys[idx]
     return tar_pids
+

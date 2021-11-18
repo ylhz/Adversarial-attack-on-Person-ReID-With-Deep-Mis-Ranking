@@ -39,6 +39,7 @@ from attack import attack, save_imgs, normalize, get_all_feature, get_feature_ce
 parser = argparse.ArgumentParser(description='adversarial attack')
 parser.add_argument('--root', type=str, default='data', help="root path to data directory")
 parser.add_argument('--targetmodel', type=str, default='aligned', choices=models.get_names())
+parser.add_argument('--blackmodel', type=str, default='cam', choices=models.get_names())
 parser.add_argument('--dataset', type=str, default='market1501', choices=data_manager.get_names())
 parser.add_argument('--gpu', type=str, default='0', help="gpu idx")
 
@@ -47,6 +48,7 @@ parser.add_argument('--iter_num', type=int, default=10, help='迭代次数')
 # PATH
 parser.add_argument('--G_resume_dir', type=str, default='', metavar='path to resume G')
 parser.add_argument('--pre_dir', type=str, default='models', help='path to be attacked model')
+
 parser.add_argument('--attr_dir', type=str, default='', help='path to attribute file')
 parser.add_argument('--save_dir', type=str, default='logs', help='path to save model')
 parser.add_argument('--vis_dir', type=str, default='vis', help='path to save visualization result')
@@ -91,6 +93,7 @@ if args.attr_dir:
     args.ablation = osp.join('attr', args.attr_key + '=' + str(args.attr_value))
 
 pre_dir = osp.join(args.pre_dir, args.targetmodel, args.dataset+'.pth.tar')
+black_dir = osp.join(args.pre_dir, args.blackmodel, args.dataset+'.pth.tar')
 save_dir = osp.join(args.save_dir, args.targetmodel, args.dataset, args.ablation)
 vis_dir = osp.join(args.vis_dir, args.targetmodel, args.dataset, 'adv_eps{}'.format(args.eps),args.ablation)
 # vis_dir = osp.join(args.vis_dir, args.targetmodel, args.dataset, 'ori', args.ablation)
@@ -138,28 +141,24 @@ def main(opt):
 
     ### Prepare pretrained model ###
     target_net = models.init_model(name=args.targetmodel, pre_dir=pre_dir, num_classes=dataset.num_train_pids)
+    
+    black_net = models.init_model(name=args.blackmodel, pre_dir=black_dir, num_classes=dataset.num_train_pids)
     # target_net = nn.Sequential(
     #     Normalize(mean=Imagenet_mean, std=Imagenet_stddev, mode='torch'),
     #     models.init_model(name=args.targetmodel, pre_dir=pre_dir, num_classes=dataset.num_train_pids),
     # )
     check_freezen(target_net, need_modified=True, after_modified=False)
+    check_freezen(black_net, need_modified=True, after_modified=False)
 
     ### Prepare main net ###
-    G = Generator(3, 3, args.num_ker, norm=args.normalization).apply(weights_init)
-    if args.D == 'PatchGAN':
-        D = Pat_Discriminator(input_nc=6, norm=args.normalization).apply(weights_init)
-    elif args.D == 'MSGAN':    # muti-stage gan
-        D = MS_Discriminator(input_nc=6, norm=args.normalization, temperature=args.temperature, use_gumbel=args.usegumbel).apply(weights_init)
-    check_freezen(G, need_modified=True, after_modified=True)
-    check_freezen(D, need_modified=True, after_modified=True)
-    print("Model size: {:.5f}M".format((sum(g.numel() for g in G.parameters())+sum(d.numel() for d in D.parameters()))/1000000.0))
+
     # setup optimizer
-    optimizer_G = optim.Adam(G.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
-    optimizer_D = optim.Adam(D.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
     
     if use_gpu: 
         test_target_net = nn.DataParallel(target_net).cuda() if not args.targetmodel == 'pcb' else nn.DataParallel(PCB_test(target_net)).cuda()
-        target_net = nn.DataParallel(target_net).cuda() 
+        target_net = nn.DataParallel(target_net).cuda()
+
+        test_black_net = nn.DataParallel(black_net).cuda() if not args.targetmodel == 'pcb' else nn.DataParallel(PCB_test(black_net)).cuda()       
 
     # ToDO:
     # 0. 把所有Query的特征向量提取出来
@@ -179,10 +178,14 @@ def main(opt):
     ranks = [1, 5, 10, 20]
     with torch.no_grad():
         print("get features of all gallery images:")
-        gf, lgf, g_pids, g_camids = extract_and_perturb(galleryloader, target_net, use_gpu, query_or_gallery='gallery') # cpu
+        gf, lgf, g_pids, g_camids = extract_and_perturb(galleryloader, target_net, args.targetmodel, use_gpu, query_or_gallery='gallery') # cpu
+        black_gf, black_lgf, g_pids, g_camids = extract_and_perturb(galleryloader, test_black_net,args.blackmodel ,use_gpu, query_or_gallery='gallery') # cpu
 
 
     qf, lqf, new_qf, new_lqf, q_pids, tar_pids, q_camids = [], [], [], [], [], [], []
+    black_qf, black_lqf = [], []
+    new_black_qf, new_black_lqf = [], []
+    print("Attack:")
     for batch_idx, (imgs, pids, camids, pids_raw) in enumerate(tqdm(queryloader)):
         
         imgs = imgs.cuda()
@@ -192,12 +195,15 @@ def main(opt):
         
         # save
         save_imgs(adv_imgs, pids, batch_idx, vis_dir)
+        # adv_imgs = imgs.clone()
         
         # test
         with torch.no_grad():
             
-            ls = extract(imgs, test_target_net)
-            new_ls = extract(adv_imgs, test_target_net)
+            ls = extract(imgs.clone(), test_target_net)
+            new_ls = extract(adv_imgs.clone(), test_target_net)
+            black_ls = [extract(imgs.clone(), test_black_net)[1]]  # 黑盒
+            new_black_ls = [extract(adv_imgs.clone(), test_black_net)[1]]  # 黑盒
             if len(ls) == 1: 
                 features = ls[0]
                 new_features = new_ls[0]
@@ -206,29 +212,57 @@ def main(opt):
                 new_features, new_local_features = new_ls    # []
                 lqf.append(local_features.clone().detach().data)
                 new_lqf.append(new_local_features.clone().detach().data)
+            
+            # 黑盒
+            if len(black_ls) == 1: 
+                black_features = black_ls[0]
+                new_black_features = new_black_ls[0]
+            if len(black_ls) == 2: 
+                black_features, black_local_features = black_ls    # [] 
+                black_lqf.append(black_local_features.clone().detach().data)
+
             qf.append(features.clone().detach().data)
             new_qf.append(new_features.clone().detach().data)
+            black_qf.append(black_features.clone().detach().data)
+            new_black_qf.append(new_black_features.clone().detach().data)
+
             q_pids.extend(pids)
             q_camids.extend(camids)
 
     qf = torch.cat(qf, 0)
     new_qf = torch.cat(new_qf, 0)
+    black_qf = torch.cat(black_qf, 0)
+    new_black_qf = torch.cat(new_black_qf, 0)
     if not lqf == []: lqf = torch.cat(lqf, 0)
     if not new_lqf == []: new_lqf = torch.cat(new_lqf, 0)
+    if not black_lqf == []: black_lqf = torch.cat(black_lqf, 0)
     q_pids, q_camids = np.asarray(q_pids), np.asarray(q_camids)
 
     # result
-    print("查询干净图片")
-    distmat, cmc, mAP, t_cmc, t_mAP = make_results(qf.cpu(), gf.cpu(), lqf.cpu(), lgf.cpu(), q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, tar_center, mode='adv')
-    print("查询对抗样本图片")
+    print("#"*20+"\n","查询干净图片:")
+    distmat, cmc, mAP, t_cmc, t_mAP = make_results(qf, gf, lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, tar_center, mode='adv')
+    print("#"*20+"\n","查询对抗样本图片:")
     new_distmat, new_cmc, new_mAP, t_new_cmc, t_new_mAP = make_results(new_qf, gf, new_lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, tar_center, mode='adv')
+    print("#"*20+"\n","黑盒查询:")
+    black_distmat, black_cmc, black_mAP, t_black_cmc, t_black_mAP = make_results(black_qf, black_gf, black_lqf, black_lgf, q_pids, g_pids, q_camids, g_camids, args.blackmodel, args.ak_type, tar_center, mode='adv')
+
+    new_black_distmat, new_black_cmc, new_black_mAP, t_new_black_cmc, t_new_black_mAP = make_results(new_black_qf, black_gf, new_black_lqf, black_lgf, q_pids, g_pids, q_camids, g_camids, args.blackmodel, args.ak_type, tar_center, mode='adv')
+
     # print("查询对抗样本目标攻击图片")
-    # tar_distmat, tar_cmc, tar_mAP = make_results(new_qf, gf, new_lqf, lgf, q_pids, g_pids, q_camids, g_camids, args.targetmodel, args.ak_type, tar_center)
     print("Results ----------")
     print("Before  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(mAP, ranks[0], cmc[ranks[0]-1], ranks[1], cmc[ranks[1]-1], ranks[2], cmc[ranks[2]-1], ranks[3], cmc[ranks[3]-1]))
     print("t_Before, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_mAP, ranks[0], t_cmc[ranks[0]-1], ranks[1], t_cmc[ranks[1]-1], ranks[2], t_cmc[ranks[2]-1], ranks[3], t_cmc[ranks[3]-1]))
+    print("白盒测试")
     print("After  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(new_mAP, ranks[0], new_cmc[ranks[0]-1], ranks[1], new_cmc[ranks[1]-1], ranks[2], new_cmc[ranks[2]-1], ranks[3], new_cmc[ranks[3]-1]))
     print("t_After, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_new_mAP, ranks[0], t_new_cmc[ranks[0]-1], ranks[1], t_new_cmc[ranks[1]-1], ranks[2], t_new_cmc[ranks[2]-1], ranks[3], t_new_cmc[ranks[3]-1]))
+    
+    # 黑盒
+    print("黑盒测试")
+    print("Black  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(black_mAP, ranks[0], black_cmc[ranks[0]-1], ranks[1], black_cmc[ranks[1]-1], ranks[2], black_cmc[ranks[2]-1], ranks[3], black_cmc[ranks[3]-1]))
+    print("t_Black, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_black_mAP, ranks[0], t_black_cmc[ranks[0]-1], ranks[1], t_black_cmc[ranks[1]-1], ranks[2], t_black_cmc[ranks[2]-1], ranks[3], t_black_cmc[ranks[3]-1]))    
+
+    print("Black  , mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(new_black_mAP, ranks[0], new_black_cmc[ranks[0]-1], ranks[1], new_black_cmc[ranks[1]-1], ranks[2], new_black_cmc[ranks[2]-1], ranks[3], new_black_cmc[ranks[3]-1]))
+    print("t_Black, mAP: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}, Rank-{}: {:.1%}".format(t_new_black_mAP, ranks[0], t_new_black_cmc[ranks[0]-1], ranks[1], t_new_black_cmc[ranks[1]-1], ranks[2], t_new_black_cmc[ranks[2]-1], ranks[3], t_new_black_cmc[ranks[3]-1]))    
 
     
 
@@ -252,13 +286,17 @@ def extract_features(imgs, target_net):
 
 
 
-def extract_and_perturb(loader, target_net, use_gpu, query_or_gallery):
+def extract_and_perturb(loader, target_net, net_name, use_gpu, query_or_gallery):
     f, lf, new_f, new_lf, l_pids, l_camids = [], [], [], [], [], []
     ave_mask, num = 0, 0
     for batch_idx, (imgs, pids, camids, pids_raw) in enumerate(tqdm(loader)):
         if use_gpu: 
             imgs = imgs.cuda()
-        ls = extract(imgs, target_net)
+        if net_name == 'cam':
+            ls = [extract(imgs, target_net)[1]]
+        else:
+            ls = extract(imgs, target_net)
+        
         if len(ls) == 1: features = ls[0]
         if len(ls) == 2: 
             features, local_features = ls    # []
